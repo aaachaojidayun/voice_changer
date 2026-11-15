@@ -139,6 +139,71 @@ ps.readTail(buf, cap);         // 取残余
 固定延迟 `latency()` = N + 8 个样本（N=1024 时 1032）。离线场景下裁掉即可，
 实时场景可容忍或在前端补偿。
 
+## 实时变声（Windows）
+
+`src/live_win.cpp` 提供 `vc_live`：直接拿麦克风说话、从耳机听变声结果，
+不需要先录音再转文件。核心算法完全复用 `vc::PitchShifter`。
+
+### 构建
+
+```powershell
+g++ -std=c++17 -O2 -Iinclude src/fft.cpp src/resampler.cpp src/phase_vocoder.cpp `
+    src/pitch_shifter.cpp src/wav_io.cpp src/live_win.cpp -o build/vc_live.exe -lole32 -luuid
+```
+
+CMake 构建时只在 `WIN32` 下生成 `vc_live` 目标，离线 CLI 与核心库保持零依赖、
+仍可交叉编译到 aarch64。
+
+### 使用
+
+```powershell
+.\build\vc_live.exe --list                       # 先看设备编号
+.\build\vc_live.exe --capture 0 --render 0 --pitch 1.5
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--list` | 列出活动状态的麦克风与播放设备编号（标注系统默认项） |
+| `--capture N` | 用编号 N 的麦克风，省略则用系统默认麦克风 |
+| `--render N` | 用编号 N 的播放设备，省略则用系统默认播放设备 |
+| `--pitch` | 初始变调倍数，默认 1.5，允许 0.05~8.0 |
+| `--fft` | 512 / 1024 / 2048 / 4096，默认 1024 |
+
+运行中在控制台输入数字回车即时切换音调，`s` 打印运行状态，`q` 退出。
+**耳机常常不是默认播放设备**（Realtek 声卡会把默认保持在"扬声器"），
+用 `--list` 确认后用 `--render N` 指定，否则声音会从外放出来。
+
+### 实现要点
+
+- **WASAPI 共享模式 + 事件驱动**。两端都请求事件回调，避免轮询空转；
+  混音格式由系统给出（本机为 48 kHz / 2 声道 / float32），代码支持
+  float32 与 16/32-bit PCM，采样率不一致时直接报错而不是悄悄变速。
+- **线程模型**：采集线程内完成「取包 → 混单声道 → `PitchShifter::process`
+  → 写入无锁环形缓冲」；播放线程只做「从环形缓冲取 → 写设备缓冲」。
+  跨线程只用 `vc::SpscRing`（原子读写指针 + acquire/release），全程无锁、
+  音频路径零 malloc。
+- **启动顺序**：先启采集、等它真正产出第一块音频后再启播放。麦克风从
+  `Start` 到出第一个包常有数百毫秒，同时启动会连续欠载、开头一段空白。
+- **运行期换音调不爆音**：不直接改 `Resampler::setStep()`（那会打断相位累积，
+  听感是"啪"的爆音），而是在非实时线程构造新的 `PitchShifter`，
+  处理线程在下一块开始用 50 ms 交叉淡化切入新实例，旧实例延迟释放。
+
+### 实测（本机 Realtek 声卡，48 kHz）
+
+10 秒连续运行，每 10 ms 一块：
+
+```
+块数=940  欠载=0  溢出=0  积压=960 样本（稳定）
+```
+
+全链路延迟约 40~50 ms（采集周期 10 ms + 算法固定延迟 21.5 ms + 播放缓冲）。
+
+### 已知限制
+
+- 仅 Windows（WASAPI）。Linux 端可换 ALSA/PipeWire，`SpscRing` 与算法层不用改。
+- 输出为单声道处理结果复制到左右声道，不做立体声分别处理。
+- 算法固定延迟 `latency()` 未在实时路径上补偿（实时场景表现为约 21 ms 延迟）。
+
 ## 已验证结果
 
 在本机 WSL Ubuntu 24.04 / g++ 13.3.0 上编译并跑通，`-Wall -Wextra -Wpedantic`

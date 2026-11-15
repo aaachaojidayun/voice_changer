@@ -32,6 +32,18 @@ endif()
 add_executable(voice_changer src/main.cpp)
 target_link_libraries(voice_changer PRIVATE vc_core)
 
+# ---- 实时变声（Windows / WASAPI 共享模式）----
+# 只在 Windows 上构建：依赖 WASAPI（ole32/uuid）与多线程。
+# 其他平台没有这个目标，离线 CLI 与核心库保持零依赖、可交叉编译。
+if(WIN32)
+  add_executable(vc_live src/live_win.cpp)
+  target_link_libraries(vc_live PRIVATE vc_core ole32 uuid)
+  if(MINGW)
+    # 静态链接 MinGW 运行时，双击 exe 时不依赖 libstdc++-6.dll
+    target_link_options(vc_live PRIVATE -static)
+  endif()
+endif()
+
 option(VC_BUILD_TESTS "Build unit tests" ON)
 
 if(VC_BUILD_TESTS)
