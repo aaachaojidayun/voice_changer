@@ -28,3 +28,9 @@ vc_test_roundtrip.wav
 *.swp
 .DS_Store
 Thumbs.db
+
+# 中间产物（探针脚本、测试 wav、临时 exe）
+temp/
+
+# 快捷方式（含本机绝对路径）
+*.lnk

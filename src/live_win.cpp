@@ -370,6 +370,8 @@ struct LiveState {
     std::atomic<float> outPeak{0.0f}; // 输出峰值（判断是否有信号送给耳机）
     vc::SpscRing ring;
     int sampleRate = 48000;
+    FILE* rec = nullptr;              // --record 时把真正送耳机的信号写成 WAV（PCM16 单声道）
+    unsigned long long recFrames = 0; // 已写入的样本数
 };
 
 volatile LONG g_ctrlStop = 0;
@@ -569,6 +571,19 @@ void renderLoop(Session* s, LiveState* st) {
             st->underruns.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // 录音：把真正送给耳机的这一块原样写成 PCM16，用于事后客观比对变声效果。
+        if (st->rec) {
+            std::vector<short> tmp(avail);
+            for (UINT32 i = 0; i < avail; ++i) {
+                float x = mono[i];
+                if (x > 1.0f) x = 1.0f;
+                if (x < -1.0f) x = -1.0f;
+                tmp[i] = static_cast<short>(x * 32767.0f);
+            }
+            std::fwrite(tmp.data(), sizeof(short), avail, st->rec);
+            st->recFrames += avail;
+        }
+
         BYTE* p = nullptr;
         hr = render->GetBuffer(avail, &p);
         if (FAILED(hr)) break;
@@ -593,6 +608,7 @@ void printUsage() {
         "  --render N        用编号为 N 的播放设备（默认用系统默认播放设备）\n"
         "  --pitch 倍数      初始变调倍数，默认 1.5（>1 变尖、<1 变低沉）\n"
         "  --fft N           Phase Vocoder 的 FFT 长度，默认 1024（越大越稳、延迟越高）\n"
+        "  --record 文件.wav 把实际送给播放设备的信号录成 WAV，用于事后比对变声效果\n"
         "\n"
         "运行时在控制台输入数字并回车可实时切换音调倍数，输入 s 查看运行状态，输入 q 退出。\n");
 }
@@ -613,16 +629,68 @@ void printOneLineStatus(const LiveState& st) {
     }
 }
 
+// 44 字节 PCM16 单声道 WAV 头（写两遍：先占位，退出时回填真实长度）。
+void writeWavHeader(FILE* f, int sampleRate, unsigned long long frames) {
+    unsigned char h[44] = {0};
+    const char* riff = "RIFF";
+    const char* wave = "WAVE";
+    const char* fmt = "fmt ";
+    const char* data = "data";
+    for (int i = 0; i < 4; ++i) {
+        h[i] = static_cast<unsigned char>(riff[i]);
+        h[8 + i] = static_cast<unsigned char>(wave[i]);
+        h[12 + i] = static_cast<unsigned char>(fmt[i]);
+        h[36 + i] = static_cast<unsigned char>(data[i]);
+    }
+    const unsigned long long dataBytes = frames * 2ULL;
+    const unsigned int byteRate = static_cast<unsigned int>(sampleRate) * 2u;
+    h[4] = static_cast<unsigned char>(36ULL + dataBytes);
+    h[5] = static_cast<unsigned char>((36ULL + dataBytes) >> 8);
+    h[6] = static_cast<unsigned char>((36ULL + dataBytes) >> 16);
+    h[7] = static_cast<unsigned char>((36ULL + dataBytes) >> 24);
+    h[16] = 16;  // fmt chunk size
+    h[20] = 1;   // PCM
+    h[22] = 1;   // 单声道
+    h[24] = static_cast<unsigned char>(sampleRate);
+    h[25] = static_cast<unsigned char>(sampleRate >> 8);
+    h[26] = static_cast<unsigned char>(sampleRate >> 16);
+    h[27] = static_cast<unsigned char>(sampleRate >> 24);
+    h[28] = static_cast<unsigned char>(byteRate);
+    h[29] = static_cast<unsigned char>(byteRate >> 8);
+    h[30] = static_cast<unsigned char>(byteRate >> 16);
+    h[31] = static_cast<unsigned char>(byteRate >> 24);
+    h[32] = 2;   // block align
+    h[34] = 16;  // bits per sample
+    h[40] = static_cast<unsigned char>(dataBytes);
+    h[41] = static_cast<unsigned char>(dataBytes >> 8);
+    h[42] = static_cast<unsigned char>(dataBytes >> 16);
+    h[43] = static_cast<unsigned char>(dataBytes >> 24);
+    std::fwrite(h, 1, sizeof(h), f);
+}
+
+// 控制台可用输入说明。启动时打印一次，之后输入 ? 可随时再看。
+void printCommandHelp(const char* indent) {
+    std::printf("%s可用输入（输入后按回车）：\n", indent);
+    std::printf("%s  0.05 ~ 8.0 之间的数字   切换音调倍数，例：0.7 降调 / 1.5 升调 / 2.0 升更多\n", indent);
+    std::printf("%s  s                       查看运行状态（块数 / 欠载 / 积压 / 输入输出电平）\n", indent);
+    std::printf("%s  ?  或  h  或  help      重新显示这份说明\n", indent);
+    std::printf("%s  q  或  quit  或  exit   退出程序\n", indent);
+    std::printf("%s其它任何输入都会被忽略，不会中断变声。\n", indent);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    // 输出不缓冲：保证提示与状态立刻出现在页面上（重定向到文件/管道时也一样）。
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     float pitch = 1.5f;
     int fftSize = 1024;
     bool listOnly = false;
     int captureIndex = -1;
     int renderIndex = -1;
+    const char* recordPath = nullptr;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -634,6 +702,8 @@ int main(int argc, char** argv) {
             captureIndex = std::atoi(argv[++i]);
         } else if (arg == "--render" && i + 1 < argc) {
             renderIndex = std::atoi(argv[++i]);
+        } else if (arg == "--record" && i + 1 < argc) {
+            recordPath = argv[++i];
         } else if (arg == "--list") {
             listOnly = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -755,6 +825,16 @@ int main(int argc, char** argv) {
     state.sampleRate = session.capture.info.sampleRate;
     state.ring.resize(static_cast<std::size_t>(state.sampleRate) / 2);
 
+    if (recordPath) {
+        state.rec = std::fopen(recordPath, "wb");
+        if (state.rec) {
+            writeWavHeader(state.rec, state.sampleRate, 0);  // 先占位，退出时回填
+            std::printf("      录音: %s（把实际送耳机的信号录成 WAV，用于比对变声效果）\n", recordPath);
+        } else {
+            std::printf("      [!] 无法创建录音文件 %s，本次不录音。\n", recordPath);
+        }
+    }
+
     std::printf("\n[2/4] 启动渲染与采集线程（音调 %.3f，FFT %d，采样率 %d）...\n", pitch, fftSize,
                 state.sampleRate);
 
@@ -785,38 +865,68 @@ int main(int argc, char** argv) {
 
     std::printf("\n[3/4] 已开始实时变声。\n");
     std::printf("      戴上耳机，对着笔记本麦克风说话即可听到变声后的声音。\n");
-    std::printf("      在下面输入数字并回车可切换音调（如 1.5 / 0.7 / 2.0），输入 q 退出。\n\n");
+    printCommandHelp("      ");
+    std::printf("\n");
 
     // 主线程：读控制台指令。
+    // 原则：任何键盘输入（包括空行、乱码、超长行、EOF）都只被"忽略"，
+    //       绝不能让它跳出循环把变声停掉；只有显式输入 q/quit/exit 才退出。
     std::vector<vc::PitchShifter*> retired;
-    char line[128];
+    char line[256];
     while (!g_ctrlStop) {
-        if (!std::fgets(line, sizeof(line), stdin)) break;
+        if (!std::fgets(line, sizeof(line), stdin)) {
+            // 读失败/EOF（例如误按 Ctrl+Z 回车、输入被重定向）：清掉错误标志继续跑，
+            // 不能像以前那样 break 掉主线程（那会连带把采集和播放线程一起停掉）。
+            std::clearerr(stdin);
+            Sleep(50);
+            continue;
+        }
 
         // 去掉换行。
         std::string cmd(line);
         while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' ')) {
             cmd.pop_back();
         }
-        if (cmd.empty()) continue;
+
+        // 超长行：本行没读到换行说明被截断了，把剩余字节吃掉，
+        // 否则残余内容会被当成下一条指令逐段回显。
+        if (std::string(line).find('\n') == std::string::npos) {
+            int ch = 0;
+            while ((ch = std::fgetc(stdin)) != EOF && ch != '\n') {
+            }
+            std::clearerr(stdin);
+        }
+
+        if (cmd.empty()) continue;  // 空行直接忽略
         if (cmd == "q" || cmd == "Q" || cmd == "quit" || cmd == "exit") break;
         if (cmd == "s" || cmd == "S") {
             printOneLineStatus(state);
+            continue;
+        }
+        if (cmd == "?" || cmd == "h" || cmd == "H" || cmd == "help") {
+            printCommandHelp("    ");
             continue;
         }
 
         char* end = nullptr;
         const double v = std::strtod(cmd.c_str(), &end);
         if (!end || end == cmd.c_str() || !(v > 0.05 && v < 8.0)) {
-            std::printf("    无效输入。请输入 0.05 ~ 8.0 之间的倍数，或 q 退出。\n");
+            // 无效输入：只提示，不中断。
+            std::printf("    已忽略无效输入（变声仍在运行）。音调需在 0.05 ~ 8.0 之间，输入 ? 查看可用输入。\n");
             continue;
         }
 
         // 在非实时线程构造新实例，再投递给处理线程切换。
-        auto* fresh = new (std::nothrow) vc::PitchShifter(static_cast<float>(state.sampleRate),
-                                                          static_cast<float>(v), fftSize);
+        // 外层 try/catch 兜住构造期异常（如内部缓冲分配失败），避免异常冒泡终止进程。
+        vc::PitchShifter* fresh = nullptr;
+        try {
+            fresh = new (std::nothrow) vc::PitchShifter(static_cast<float>(state.sampleRate),
+                                                        static_cast<float>(v), fftSize);
+        } catch (...) {
+            fresh = nullptr;
+        }
         if (!fresh) {
-            std::printf("    内存不足，切换失败。\n");
+            std::printf("    内存不足，本次切换失败（变声仍在运行，可换别的倍数再试）。\n");
             continue;
         }
         vc::PitchShifter* prev = state.pending.exchange(fresh);
@@ -836,6 +946,17 @@ int main(int argc, char** argv) {
     if (vc::PitchShifter* p = state.active.exchange(nullptr)) retired.push_back(p);
     if (vc::PitchShifter* p = state.pending.exchange(nullptr)) retired.push_back(p);
     for (vc::PitchShifter* p : retired) delete p;
+
+    // 录音收尾：回填真实长度。
+    if (state.rec) {
+        std::fflush(state.rec);
+        std::fseek(state.rec, 0, SEEK_SET);
+        writeWavHeader(state.rec, state.sampleRate, state.recFrames);
+        std::fclose(state.rec);
+        state.rec = nullptr;
+        std::printf("    录音已保存: %s（%.1f 秒）\n", recordPath,
+                    static_cast<double>(state.recFrames) / static_cast<double>(state.sampleRate));
+    }
 
     closeEndpoint(session.capture);
     closeEndpoint(session.render);

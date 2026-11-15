@@ -8,6 +8,9 @@ rem   run_live.bat --list      -> just list device indexes
 chcp 65001 >nul
 cd /d "%~dp0"
 
+rem 双击运行时不会继承开发环境的 PATH，这里补上 MinGW（只在需要重新编译时用到）
+if exist "D:\mingw64\bin\g++.exe" set "PATH=D:\mingw64\bin;%PATH%"
+
 if not exist build\vc_live.exe (
   echo [build] compiling vc_live.exe ...
   if not exist build mkdir build
@@ -29,9 +32,13 @@ if /i "%~1"=="--list" (
 set CAP=%~1
 set REN=%~2
 set PIT=%~3
+if "%PIT%"=="" set PIT=1.5
+
+rem 默认用 0 号设备：本机实测只有"麦克风阵列 (Realtek(R) Audio)"能真正拾音
+rem （MCHOSE V9 PRO 无线耳机的麦克风在系统里几乎无信号，约 -110 dBFS，等于静音）。
+rem 换了设备先跑: run_live.bat --list 看编号。
 if "%CAP%"=="" set CAP=0
 if "%REN%"=="" set REN=0
-if "%PIT%"=="" set PIT=1.5
 
 build\vc_live.exe --capture %CAP% --render %REN% --pitch %PIT%
 pause
